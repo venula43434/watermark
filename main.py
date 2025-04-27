@@ -2,6 +2,8 @@ import os
 import logging
 import tempfile
 import time
+import signal
+import sys
 from io import BytesIO
 from PIL import Image
 import requests
@@ -30,6 +32,54 @@ PROCESSING_ANIMATIONS = [
 
 # Watermark size percentage (percentage of the image width)
 WATERMARK_WIDTH_PERCENT = 40  # Adjust this value to make watermark bigger or smaller
+
+# Flag to control the bot's running state
+running = True
+
+# Create a lock file to prevent multiple instances
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "savanro_watermark_bot.lock")
+
+# Function to check if bot is already running
+def is_bot_running():
+    if os.path.exists(LOCK_FILE):
+        # Check if the process is still running
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            # Try to send signal 0 to the process (doesn't kill it, just checks existence)
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, ValueError, FileNotFoundError):
+            # Process doesn't exist, remove stale lock file
+            try:
+                os.unlink(LOCK_FILE)
+            except:
+                pass
+            return False
+    return False
+
+# Function to create lock file
+def create_lock_file():
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+# Function to remove lock file
+def remove_lock_file():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.unlink(LOCK_FILE)
+    except:
+        pass
+
+# Signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    global running
+    logger.info("Shutdown signal received, closing bot gracefully...")
+    running = False
+    remove_lock_file()
+    # Let the async loop finish closing connections
+    time.sleep(2)
+    sys.exit(0)
 
 # Function to download and save the watermark bar
 async def download_watermark():
@@ -179,6 +229,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         'Use the buttons below to start processing or clear chat history.',
         reply_markup=reply_markup
     )
+
+# Command handler for admin shutdown
+async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global running
+    await update.message.reply_text("Shutting down bot safely. Goodbye! 👋")
+    running = False
+    # Signal the application to stop
+    application = context.application
+    await application.stop()
+    # Remove lock file
+    remove_lock_file()
+    # Exit the script
+    os._exit(0)
 
 # Callback handler for button presses
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -369,30 +432,6 @@ async def set_watermark_size(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Error in set_watermark_size: {e}")
         await update.message.reply_text("An error occurred while setting the watermark size.")
 
-# Main function to run the bot
-def main() -> None:
-    # Create the Application and pass it your bot's token
-    application = Application.builder().token(TOKEN).build()
-
-    # Register an error handler
-    application.add_error_handler(error_handler)
-
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("size", set_watermark_size))
-
-    # Add callback query handler for buttons
-    application.add_handler(CallbackQueryHandler(button_callback))
-
-    # Add message handlers
-    application.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
-
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling()
-    logger.info("Bot started. Press Ctrl+C to stop.")
-
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Update {update} caused error {context.error}")
@@ -400,6 +439,53 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # If an update caused an error and we can reply to it
     if update and update.effective_message:
         await update.effective_message.reply_text("Sorry, something went wrong. Please try again.")
+
+# Main function to run the bot
+def main() -> None:
+    # Check if bot is already running
+    if is_bot_running():
+        logger.error("Bot is already running! Exiting.")
+        print("Bot is already running! If you believe this is an error, delete the lock file at:", LOCK_FILE)
+        sys.exit(1)
+    
+    # Create lock file
+    create_lock_file()
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    
+    try:
+        # Create the Application and pass it your bot's token
+        application = Application.builder().token(TOKEN).build()
+
+        # Register an error handler
+        application.add_error_handler(error_handler)
+
+        # Add command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("size", set_watermark_size))
+        application.add_handler(CommandHandler("shutdown", shutdown_command))
+
+        # Add callback query handler for buttons
+        application.add_handler(CallbackQueryHandler(button_callback))
+
+        # Add message handlers
+        application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+        application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
+
+        # Run the bot
+        logger.info("Bot started. Press Ctrl+C to stop or use /shutdown command.")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        remove_lock_file()
+        sys.exit(1)
+    finally:
+        # Always remove lock file when exiting
+        remove_lock_file()
 
 if __name__ == '__main__':
     main()
